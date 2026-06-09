@@ -28,7 +28,7 @@ import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import { buildMcpServer, readConfig } from "./build-server.js";
 import { DashboardStore } from "./store.js";
 import { DashboardMcpOAuthProvider } from "./oauth.js";
-import { renderGallery } from "./gallery.js";
+import { renderGallery, renderImportPage } from "./gallery.js";
 import { fetchSheetData } from "./sheet-proxy.js";
 
 const log = (...args: unknown[]): void => {
@@ -164,6 +164,62 @@ async function main(): Promise<void> {
       log(`data proxy error for "${slug}":`, msg);
       res.status(502).json({ error: `Failed to fetch data: ${msg}` });
     }
+  });
+
+  /* ---- Manual import: POST /api/dashboards ---- */
+
+  app.post("/api/dashboards", (req, res) => {
+    const header = req.header("authorization") ?? "";
+    const m = /^Bearer\s+(.+)$/i.exec(header);
+    if (!m || !m[1] || !oauth.isAdminToken(m[1].trim())) {
+      res.status(401).json({ error: "Unauthorized \u2014 invalid admin token" });
+      return;
+    }
+
+    const { slug, name, description, category, html, sheetUrl } = req.body as {
+      slug?: string;
+      name?: string;
+      description?: string;
+      category?: string;
+      html?: string;
+      sheetUrl?: string;
+    };
+
+    if (!slug || !name || !html) {
+      res.status(400).json({ error: "Missing required fields: slug, name, html" });
+      return;
+    }
+
+    if (!/^[a-z0-9][a-z0-9-]*[a-z0-9]$/.test(slug) && !/^[a-z0-9]$/.test(slug)) {
+      res.status(400).json({ error: "Invalid slug: use lowercase letters, numbers, and hyphens" });
+      return;
+    }
+
+    // Reserved slugs
+    const reserved = ["import", "mcp", "healthz", "api", "data", "oauth"];
+    if (reserved.includes(slug)) {
+      res.status(400).json({ error: `Slug "${slug}" is reserved` });
+      return;
+    }
+
+    const meta = store.deploy(
+      slug,
+      name,
+      description ?? "",
+      html,
+      category ?? "General",
+      sheetUrl ?? "",
+    );
+
+    log(`dashboard "${slug}" deployed via manual import`);
+    res.json({
+      ok: true,
+      dashboard: {
+        ...meta,
+        url: `${cfg.baseUrl}/${meta.slug}`,
+        dataUrl: meta.sheetUrl ? `${cfg.baseUrl}/data/${meta.slug}` : null,
+      },
+    });
   });
 
   /* ---- Delete dashboard: DELETE /api/dashboards/:slug ---- */
@@ -321,6 +377,11 @@ async function main(): Promise<void> {
     res.send(renderGallery(dashboards));
   });
 
+  app.get("/import", (_req, res) => {
+    res.set("content-type", "text/html; charset=utf-8");
+    res.send(renderImportPage());
+  });
+
   // Serve individual dashboards — inject data API global variable
   app.get("/:slug", (req, res) => {
     const slug = req.params.slug;
@@ -346,9 +407,24 @@ async function main(): Promise<void> {
       return;
     }
 
-    // Inject data API endpoint as a global variable before </head> or at start of <body>
+    // Inject data API endpoint + auto-refresh polling script
     if (meta.sheetUrl) {
-      const dataApiScript = `<script>window.DASHBOARD_DATA_API="/data/${slug}";window.DASHBOARD_SHEET_URL="${meta.sheetUrl.replace(/"/g, '\\"')}";</script>`;
+      const dataApiScript = `<script>
+window.DASHBOARD_DATA_API="/data/${slug}";
+window.DASHBOARD_SHEET_URL="${meta.sheetUrl.replace(/"/g, '\\"')}";
+(function(){
+  var api=window.DASHBOARD_DATA_API;
+  var interval=30000;
+  function poll(){
+    fetch(api).then(function(r){return r.json()}).then(function(d){
+      window.DASHBOARD_LIVE_DATA=d;
+      window.dispatchEvent(new CustomEvent('dashboard-data-update',{detail:d}));
+    }).catch(function(){});
+  }
+  poll();
+  setInterval(poll,interval);
+})();
+</script>`;
       if (html.includes("</head>")) {
         html = html.replace("</head>", `${dataApiScript}</head>`);
       } else if (html.includes("<body")) {
